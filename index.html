@@ -1,0 +1,222 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MIDI Visualizer • Espectro</title>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap');
+        
+        body {
+            font-family: 'Inter', system-ui, sans-serif;
+            background: #0a0a0f;
+            color: #eee;
+            margin: 0;
+            padding: 20px;
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+            gap: 20px;
+        }
+        
+        button, select {
+            padding: 12px 20px;
+            font-size: 15px;
+            border-radius: 8px;
+            background: #222;
+            color: #eee;
+            border: 1px solid #444;
+        }
+        
+        button:hover { background: #00ffcc; color: #000; }
+        button.accent { background: #00ffcc; color: #000; font-weight: bold; }
+        
+        canvas {
+            background: #111;
+            border-radius: 12px;
+            box-shadow: 0 0 20px rgba(0, 255, 204, 0.2);
+        }
+        
+        #status { font-size: 16px; padding: 10px 16px; background: #222; border-radius: 8px; }
+    </style>
+</head>
+<body>
+    <div style="display:flex; justify-content:space-between; align-items:center;">
+        <h1>MIDI Visualizer • Espectro</h1>
+        <div id="status">Listo • Pulsa "Activar Audio"</div>
+    </div>
+
+    <div>
+        <button id="btnActivate">🔊 Activar Audio (IMPORTANTE)</button>
+        <button id="btnRefresh">⟳ Actualizar MIDI</button>
+    </div>
+
+    <div>
+        <label>Dispositivo MIDI: </label>
+        <select id="midiSelect" style="width:320px;">
+            <option value="">-- Selecciona tu teclado --</option>
+        </select>
+    </div>
+
+    <h2>Visualización Espectral</h2>
+    <canvas id="spectrum" width="1200" height="260"></canvas>
+
+    <h2>Datos MIDI en crudo</h2>
+    <div id="rawData" style="background:#111; padding:15px; border-radius:10px; height:180px; overflow-y:auto; font-family:monospace; font-size:14px; color:#0f0;"></div>
+
+    <script>
+        let midiAccess = null;
+        let currentInput = null;
+        let audioContext = null;
+        let analyser = null;
+        let dataArray = null;
+        let canvas, ctx;
+
+        // ==================== ACTIVAR AUDIO ====================
+        document.getElementById('btnActivate').addEventListener('click', () => {
+            if (audioContext) {
+                document.getElementById('status').innerHTML = '✅ Audio ya activado';
+                return;
+            }
+
+            audioContext = new (window.AudioContext || window.webkitAudioContext)();
+            
+            analyser = audioContext.createAnalyser();
+            analyser.fftSize = 256;
+            dataArray = new Uint8Array(analyser.frequencyBinCount);
+
+            // Ganancia para que se escuche
+            const gain = audioContext.createGain();
+            gain.gain.value = 0.4;
+            
+            analyser.connect(gain);
+            gain.connect(audioContext.destination);
+
+            document.getElementById('status').innerHTML = '✅ <strong>Audio activado</strong> • Toca tu teclado MIDI';
+            drawSpectrum();
+        });
+
+        function drawSpectrum() {
+            requestAnimationFrame(drawSpectrum);
+            if (!analyser) {
+                ctx.fillStyle = '#111';
+                ctx.fillRect(0, 0, canvas.width, canvas.height);
+                return;
+            }
+
+            analyser.getByteFrequencyData(dataArray);
+
+            ctx.fillStyle = '#111';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+            const barWidth = (canvas.width / dataArray.length) * 2.8;
+            let x = 0;
+
+            for (let i = 0; i < dataArray.length; i++) {
+                const height = (dataArray[i] / 255) * canvas.height * 0.95;
+                ctx.fillStyle = `hsl(${i * 1.8 + 160}, 100%, 68%)`;
+                ctx.fillRect(x, canvas.height - height, barWidth - 2, height);
+                x += barWidth;
+            }
+        }
+
+        // ==================== MIDI ====================
+        async function initMIDI() {
+            try {
+                midiAccess = await navigator.requestMIDIAccess({ sysex: true });
+                populateSelect();
+                document.getElementById('status').innerHTML += '<br>✅ MIDI detectado';
+            } catch (e) {
+                document.getElementById('status').textContent = '❌ Error MIDI - Acepta el permiso del navegador';
+            }
+        }
+
+        function populateSelect() {
+            const select = document.getElementById('midiSelect');
+            select.innerHTML = '<option value="">-- Selecciona tu teclado --</option>';
+            
+            for (let input of midiAccess.inputs.values()) {
+                const opt = document.createElement('option');
+                opt.value = input.id;
+                opt.textContent = input.name || 'Teclado MIDI';
+                select.appendChild(opt);
+            }
+            
+            select.onchange = () => {
+                if (currentInput) currentInput.onmidimessage = null;
+                currentInput = midiAccess.inputs.get(select.value);
+                if (currentInput) {
+                    currentInput.onmidimessage = handleMIDIMessage;
+                    document.getElementById('status').innerHTML = `✅ Escuchando: <b>${currentInput.name}</b>`;
+                }
+            };
+        }
+
+        function handleMIDIMessage(e) {
+            const data = Array.from(e.data);
+            
+            // Mostrar datos en crudo
+            const raw = document.getElementById('rawData');
+            const hex = data.map(b => b.toString(16).toUpperCase().padStart(2, '0')).join(' ');
+            const entry = document.createElement('div');
+            entry.textContent = `[${new Date().toLocaleTimeString()}] ${hex}`;
+            raw.appendChild(entry);
+            if (raw.children.length > 20) raw.removeChild(raw.children[0]);
+            raw.scrollTop = raw.scrollHeight;
+
+            // Procesar nota para que suene y genere señal en el espectro
+            const status = data[0] & 0xF0;
+            if (status === 0x90 && data[2] > 0 && audioContext) {
+                playNote(data[1], data[2]);
+            } else if ((status === 0x80 || (status === 0x90 && data[2] === 0)) && audioContext) {
+                stopNote(data[1]);
+            }
+        }
+
+        const activeNotes = {};
+
+        function playNote(note, velocity) {
+            if (!audioContext) return;
+            if (activeNotes[note]) return;
+
+            const freq = 440 * Math.pow(2, (note - 69) / 12);
+            const osc = audioContext.createOscillator();
+            const gain = audioContext.createGain();
+            
+            osc.type = 'sawtooth';
+            osc.frequency.value = freq;
+            gain.gain.value = (velocity / 127) * 0.35;
+
+            osc.connect(gain).connect(analyser);
+            osc.start();
+
+            activeNotes[note] = {osc, gain};
+        }
+
+        function stopNote(note) {
+            if (activeNotes[note]) {
+                activeNotes[note].gain.gain.linearRampToValueAtTime(0, audioContext.currentTime + 0.2);
+                activeNotes[note].osc.stop(audioContext.currentTime + 0.3);
+                delete activeNotes[note];
+            }
+        }
+
+        // Inicio
+        window.onload = () => {
+            canvas = document.getElementById('spectrum');
+            ctx = canvas.getContext('2d');
+
+            // Fondo inicial
+            ctx.fillStyle = '#111';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+            document.getElementById('btnRefresh').onclick = initMIDI;
+
+            // Intentar iniciar MIDI automáticamente
+            if (navigator.requestMIDIAccess) {
+                setTimeout(initMIDI, 800);
+            }
+        };
+    </script>
+</body>
+</html>
